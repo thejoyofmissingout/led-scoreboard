@@ -19,7 +19,11 @@ ENDPOINTS = {
     "NBA":  "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard",
     "NFL":  "https://site.api.espn.com/apis/site/v2/sports/football/nfl/scoreboard",
     "WNBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
+    "ATP":  "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard",
+    "WTA":  "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard",
 }
+
+_TENNIS_LEAGUES = frozenset({"ATP", "WTA"})
 
 SUMMARY_ENDPOINTS = {
     "MLB":  "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary",
@@ -102,6 +106,116 @@ def _best_contrast_pair(ac, ac_alt, hc, hc_alt):
     ]
     best = max(candidates, key=lambda p: _color_distance(p[0], p[1]))
     return best
+
+
+_TENNIS_SLUG = {"ATP": "mens-singles", "WTA": "womens-singles"}
+
+
+def _normalize_tennis_match(league, competition):
+    """Map a single tennis competition → compact game dict for the board."""
+    try:
+        competitors = competition.get("competitors", [])
+        if len(competitors) < 2:
+            return None
+
+        status_type = competition["status"]["type"]
+        status_name = status_type.get("name", "")
+
+        if status_name == "STATUS_SCHEDULED":
+            live = 0
+        elif status_name in ("STATUS_FINAL", "STATUS_RETIRED", "STATUS_WALKOVER"):
+            live = 2
+        else:
+            live = 1
+
+        try:
+            p1 = next(c for c in competitors if c.get("homeAway") == "away")
+            p2 = next(c for c in competitors if c.get("homeAway") == "home")
+        except StopIteration:
+            p1, p2 = competitors[0], competitors[1]
+
+        def _abbr(competitor):
+            ath = competitor.get("athlete", {})
+            name = ath.get("displayName", "???")
+            return (name.split()[-1][:3].upper() + "   ")[:3]
+
+        def _sets_won(competitor):
+            return str(sum(1 for ls in competitor.get("linescores", []) if ls.get("winner")))
+
+        p1_score = _sets_won(p1) if live > 0 else "--"
+        p2_score = _sets_won(p2) if live > 0 else "--"
+
+        # Fixed contrasting colors per tour (players have no team colors)
+        ac = "1565c0" if league == "ATP" else "c62828"  # blue / deep red
+        hc = "e65100" if league == "ATP" else "6a1b9a"  # orange / purple
+
+        period = competition["status"].get("period", 0)
+
+        if live == 0:
+            try:
+                date_str = competition.get("date", "")
+                dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+                local_dt = dt + timedelta(hours=UTC_OFFSET_HOURS)
+                hour = local_dt.hour
+                minute = local_dt.minute
+                ampm = "PM" if hour >= 12 else "AM"
+                hour12 = hour % 12 or 12
+                st = f"{hour12}:{minute:02d} {ampm}"
+            except Exception:
+                st = "UPCOMING"
+        elif live == 2:
+            st = "FINAL"
+        else:
+            # Current set number + game score within that set
+            ls1 = p1.get("linescores", [])
+            ls2 = p2.get("linescores", [])
+            cur1 = int(ls1[-1]["value"]) if ls1 else 0
+            cur2 = int(ls2[-1]["value"]) if ls2 else 0
+            st = f"S{period} {cur1}-{cur2}"
+
+        return {
+            "id":   competition["id"],
+            "lg":   league,
+            "at":   _abbr(p1),
+            "ht":   _abbr(p2),
+            "as":   p1_score[:4],
+            "hs":   p2_score[:4],
+            "ac":   ac,
+            "hc":   hc,
+            "st":   st[:12],
+            "live": live,
+        }
+    except Exception as e:
+        print(f"[tennis] normalize error: {e}")
+        return None
+
+
+def _fetch_tennis_league(league, url):
+    """
+    Fetch tennis scoreboard. ESPN nests individual matches inside
+    event.groupings[].competitions[], not directly in event.competitions[].
+    Returns only today's singles matches (recent=True flag).
+    """
+    try:
+        resp = requests.get(url, timeout=8)
+        resp.raise_for_status()
+        data = resp.json()
+        matches = []
+        for event in data.get("events", []):
+            for grouping in event.get("groupings", []):
+                slug = grouping.get("grouping", {}).get("slug", "")
+                if slug != _TENNIS_SLUG.get(league):
+                    continue
+                for competition in grouping.get("competitions", []):
+                    if not competition.get("recent", False):
+                        continue
+                    match = _normalize_tennis_match(league, competition)
+                    if match:
+                        matches.append(match)
+        return matches
+    except Exception as e:
+        print(f"[espn] Error fetching {league}: {e}")
+        return []
 
 
 def _normalize_event(league, event):
@@ -308,7 +422,21 @@ def _refresh_mlb_game(game):
         st = f"{half} {inning}"[:12] if inning else game["st"]
         if d.get("isGameOver", False):
             st = "FINAL"
-        return away_runs[:4], home_runs[:4], st
+        offense = d.get("offense", {})
+        runners = (
+            (1 if offense.get("first")  else 0) |
+            (2 if offense.get("second") else 0) |
+            (4 if offense.get("third")  else 0)
+        )
+        return {
+            "as": away_runs[:4],
+            "hs": home_runs[:4],
+            "st": st,
+            "runners": runners,
+            "outs":    int(d.get("outs",    0)),
+            "balls":   int(d.get("balls",   0)),
+            "strikes": int(d.get("strikes", 0)),
+        }
     except Exception as e:
         print(f"[mlb] linescore error {game_pk}: {e}")
         return None
@@ -343,7 +471,7 @@ def _refresh_nhl_game(game):
                 st = f"{period_str} {time_left}"[:12]
             else:
                 st = period_str
-        return away_score[:4], home_score[:4], st
+        return {"as": away_score[:4], "hs": home_score[:4], "st": st}
     except Exception as e:
         print(f"[nhl] boxscore error {game_id}: {e}")
         return None
@@ -406,7 +534,29 @@ def _fetch_game_summary(game):
                     period_str = {1:"Q1",2:"Q2",3:"Q3",4:"Q4"}.get(period, "OT")
                 st = f"{period_str} {clock}"[:12]
 
-        return str(away.get("score", "--"))[:4], str(home.get("score", "--"))[:4], st
+        result = {"as": str(away.get("score", "--"))[:4], "hs": str(home.get("score", "--"))[:4], "st": st}
+
+        if league in ("NBA", "WNBA"):
+            situation = comp.get("situation") or {}
+            sc = situation.get("shotClock")
+            result["shot_clock"] = int(sc) if sc is not None else -1
+
+            bonus_away = False
+            bonus_home = False
+            for bt in data.get("boxscore", {}).get("teams", []):
+                ha = bt.get("homeAway", "")
+                stats = {s.get("name"): s.get("displayValue", "0")
+                         for s in bt.get("statistics", []) if s.get("name")}
+                ib = str(stats.get("inBonus", "0"))
+                in_bonus = ib not in ("0", "false", "False", "")
+                if ha == "away":
+                    bonus_away = in_bonus
+                elif ha == "home":
+                    bonus_home = in_bonus
+            result["bonus_away"] = bonus_away
+            result["bonus_home"] = bonus_home
+
+        return result
     except Exception as e:
         print(f"[espn] summary error {game['id']}: {e}")
         return None
@@ -429,7 +579,7 @@ def refresh_live_scores(games):
             gid = futures[future]
             result = future.result()
             if result:
-                updated[gid]["as"], updated[gid]["hs"], updated[gid]["st"] = result
+                updated[gid].update(result)
 
     return [updated[g["id"]] for g in games]
 
@@ -453,8 +603,11 @@ def fetch_all_games(force=False):
         return cached
 
     all_games = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {executor.submit(_fetch_league, lg, url): lg for lg, url in ENDPOINTS.items()}
+    with ThreadPoolExecutor(max_workers=len(ENDPOINTS)) as executor:
+        futures = {}
+        for lg, url in ENDPOINTS.items():
+            fn = _fetch_tennis_league if lg in _TENNIS_LEAGUES else _fetch_league
+            futures[executor.submit(fn, lg, url)] = lg
         for future in as_completed(futures):
             all_games.extend(future.result())
 

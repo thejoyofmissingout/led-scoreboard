@@ -25,7 +25,7 @@ def index():
     selected = game_store.get_selected()
 
     # Group by league in preferred display order
-    league_order = ["NFL", "NBA", "MLB", "NHL", "WNBA"]
+    league_order = ["NFL", "NBA", "MLB", "NHL", "WNBA", "ATP", "WTA"]
     grouped = {}
     for lg in league_order:
         games = [g for g in all_games if g["lg"] == lg]

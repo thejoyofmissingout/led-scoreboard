@@ -66,6 +66,7 @@ MAX_FAILURES = 5
 
 def show_game(idx):
     global current_group
+    gc.collect()
     game = games[idx % len(games)]
     print("[display]", game["lg"], game["at"], game["as"] + "-" + game["hs"], game["ht"], "|", game["st"])
     try:
@@ -121,9 +122,12 @@ while True:
                     old_as, old_hs = last_scores[gid]
                     print("[score] Change:", game["at"], game["as"], "-", game["hs"], game["ht"])
                     try:
-                        numberwang.check(display, game, old_as, old_hs)
+                        fired = numberwang.check(display, game, old_as, old_hs)
                     except Exception as e:
                         print("[numberwang] Error:", e)
+                        fired = False
+                    if fired:
+                        current_group = None  # animation detached the old group; skip slide
                     scored_idx = i
                 last_scores[gid] = current
 
@@ -147,7 +151,8 @@ while True:
     # Show current game; rotate on timer only if auto_scroll is on
     if games:
         timer_expired = (now - last_switch >= GAME_DISPLAY_SEC)
-        if last_switch == 0 or (auto_scroll and timer_expired):
+        should_rotate = auto_scroll and timer_expired and len(games) > 1
+        if last_switch == 0 or should_rotate:
             show_game(game_index)
             game_index = (game_index + 1) % len(games)
             last_switch = now
