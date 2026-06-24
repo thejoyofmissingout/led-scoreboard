@@ -1,5 +1,6 @@
 """
-ESPN API client — fetches and normalizes scoreboard data for all 5 leagues.
+ESPN API client — fetches and normalizes scoreboard data for all leagues
+(NFL, NBA, MLB, NHL, WNBA, ATP, WTA, FIFA World Cup).
 All heavy lifting happens here so the CircuitPython board gets tiny JSON.
 
 Live score refresh uses native MLB/NHL APIs for lower latency:
@@ -21,9 +22,11 @@ ENDPOINTS = {
     "WNBA": "https://site.api.espn.com/apis/site/v2/sports/basketball/wnba/scoreboard",
     "ATP":  "https://site.api.espn.com/apis/site/v2/sports/tennis/atp/scoreboard",
     "WTA":  "https://site.api.espn.com/apis/site/v2/sports/tennis/wta/scoreboard",
+    "WC":   "https://site.api.espn.com/apis/site/v2/sports/soccer/fifa.world/scoreboard",
 }
 
 _TENNIS_LEAGUES = frozenset({"ATP", "WTA"})
+_SOCCER_LEAGUES = frozenset({"WC"})
 
 SUMMARY_ENDPOINTS = {
     "MLB":  "https://site.api.espn.com/apis/site/v2/sports/baseball/mlb/summary",
@@ -41,6 +44,10 @@ CACHE_TTL_IDLE = 60   # seconds when no live games
 # User's UTC offset for pre-game time display
 UTC_OFFSET_HOURS = -4  # Eastern Daylight Time (EDT, Boston)
 
+# The "sports day" rolls over at 4am local, not midnight — a late game that
+# starts after midnight (up to 3:59am) still belongs to the prior day's slate.
+DAY_ROLLOVER_HOUR = 4
+
 # Native API ID maps: ESPN game id (str) → native game id (str)
 # Rebuilt on every ESPN cache refresh.
 _mlb_native_ids = {}
@@ -52,9 +59,30 @@ _nhl_native_ids = {}
 # ---------------------------------------------------------------------------
 
 def _get_today_str():
-    """Return today's date as YYYY-MM-DD in the user's local timezone."""
-    dt = datetime.now(timezone.utc) + timedelta(hours=UTC_OFFSET_HOURS)
-    return dt.strftime("%Y-%m-%d")
+    """Return the current sports-day date (YYYY-MM-DD) in the user's local tz.
+
+    The day rolls over at DAY_ROLLOVER_HOUR (4am), so between midnight and 4am
+    the sports day is still the previous calendar date.
+    """
+    local = datetime.now(timezone.utc) + timedelta(hours=UTC_OFFSET_HOURS)
+    return (local - timedelta(hours=DAY_ROLLOVER_HOUR)).strftime("%Y-%m-%d")
+
+
+def _event_is_today(event):
+    """
+    True if the event's start belongs to today's sports day in the user's local
+    timezone. The day runs 4am→4am, so a game starting after midnight (up to
+    3:59am) still counts as the prior day's slate. ESPN scoreboards return
+    off-season future schedules (e.g. NFL Week 1 in June) and stale finals from
+    previous days; this filter drops them. Unparseable dates are kept.
+    """
+    try:
+        dt = datetime.fromisoformat(event.get("date", "").replace("Z", "+00:00"))
+        local = dt + timedelta(hours=UTC_OFFSET_HOURS)
+        event_day = (local - timedelta(hours=DAY_ROLLOVER_HOUR)).strftime("%Y-%m-%d")
+        return event_day == _get_today_str()
+    except Exception:
+        return True
 
 
 def _fetch_league(league, url):
@@ -229,15 +257,22 @@ def _normalize_event(league, event):
 
         status = event["status"]
         status_type = status["type"]
-        status_name = status_type.get("name", "")
 
         # live: 0=scheduled, 1=in-progress, 2=final
-        if status_name == "STATUS_SCHEDULED":
+        # ESPN's "state" (pre/in/post) is reliable across every sport, including
+        # soccer where finals are STATUS_FULL_TIME rather than STATUS_FINAL.
+        state = status_type.get("state", "")
+        if state == "pre":
             live = 0
-        elif status_name == "STATUS_FINAL":
+        elif state == "post":
             live = 2
         else:
             live = 1
+
+        # Drop games not happening today (off-season future schedules, stale
+        # finals from previous days). Live games are always kept.
+        if live != 1 and not _event_is_today(event):
+            return None
 
         # Build status string (≤12 chars)
         st = _build_status_string(league, event, status, live)
@@ -305,6 +340,10 @@ def _build_status_string(league, event, status, live):
         # ESPN provides e.g. "Mid 4th", "Top 7th", "Bot 9th" — use as-is
         return detail[:12]
 
+    if league in _SOCCER_LEAGUES:
+        # ESPN provides match minute / "HT" — use as-is (e.g. "45'", "HT", "90'+3")
+        return detail[:12]
+
     # For timed sports, build "CLOCK PERIOD"
     clock = status.get("displayClock", "")
     period = status.get("period", 0)
@@ -364,7 +403,8 @@ def _enrich_mlb_native_ids(mlb_games):
             key = (g["at"].strip().upper(), g["ht"].strip().upper())
             if key in pk_map:
                 new_map[g["id"]] = pk_map[key]
-        _mlb_native_ids = new_map
+        if new_map:
+            _mlb_native_ids = new_map
         print(f"[mlb] mapped {len(new_map)}/{len(mlb_games)} games to native IDs")
     except Exception as e:
         print(f"[mlb] native ID lookup failed: {e}")
@@ -393,7 +433,8 @@ def _enrich_nhl_native_ids(nhl_games):
             key = (g["at"].strip().upper(), g["ht"].strip().upper())
             if key in id_map:
                 new_map[g["id"]] = id_map[key]
-        _nhl_native_ids = new_map
+        if new_map:
+            _nhl_native_ids = new_map
         print(f"[nhl] mapped {len(new_map)}/{len(nhl_games)} games to native IDs")
     except Exception as e:
         print(f"[nhl] native ID lookup failed: {e}")

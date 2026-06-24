@@ -269,7 +269,7 @@
 
 {% for league, games in grouped.items() %}
 <div class="league-section">
-  <div class="league-header">{{ league }}</div>
+  <div class="league-header">{{ 'WORLD CUP' if league == 'WC' else league }}</div>
   <div class="game-list">
     {% for game in games %}
     <label class="game-row">

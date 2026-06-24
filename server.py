@@ -7,6 +7,7 @@ Scoreboard server — Flask app with 3 endpoints:
 
 import json
 import time
+import os
 from flask import Flask, render_template, request, redirect, url_for, jsonify
 
 import espn_client
@@ -25,7 +26,7 @@ def index():
     selected = game_store.get_selected()
 
     # Group by league in preferred display order
-    league_order = ["NFL", "NBA", "MLB", "NHL", "WNBA", "ATP", "WTA"]
+    league_order = ["WC", "NFL", "NBA", "MLB", "NHL", "WNBA", "ATP", "WTA"]
     grouped = {}
     for lg in league_order:
         games = [g for g in all_games if g["lg"] == lg]
@@ -106,6 +107,38 @@ def reset_board():
     """Signal the Matrix Portal to perform a hard reset on its next poll."""
     game_store.request_reset()
     return ("", 204)
+
+
+@app.route("/crash", methods=["POST"])
+def crash():
+    """Receive crash report from the board and append to crashes.log."""
+    try:
+        data = request.get_json(silent=True) or {}
+        reason  = data.get("reason", "unknown")
+        ctx     = data.get("ctx", "")
+        detail  = data.get("detail", "")
+        ts      = time.strftime("%Y-%m-%d %H:%M:%S")
+        line    = f"[{ts}] reason={reason} ctx={ctx} detail={detail}\n"
+        print("[crash]", line.strip())
+        log_path = os.path.join(os.path.dirname(__file__), "crashes.log")
+        with open(log_path, "a") as f:
+            f.write(line)
+    except Exception as e:
+        print("[crash] log error:", e)
+    return ("", 204)
+
+
+@app.route("/crashes")
+def crashes():
+    """Show the last 50 crash log entries."""
+    log_path = os.path.join(os.path.dirname(__file__), "crashes.log")
+    try:
+        with open(log_path) as f:
+            lines = f.readlines()
+        entries = lines[-50:]
+    except FileNotFoundError:
+        entries = []
+    return "<pre style='font-family:monospace'>" + "".join(entries) + "</pre>" if entries else "No crashes logged."
 
 
 @app.route("/refresh")
